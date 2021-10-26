@@ -1,0 +1,279 @@
+---
+title: "Supplemental Code File -- R"
+output:
+  html_document
+---
+
+
+```{r options, echo = FALSE}
+library(knitr)
+options(reticulate.repl.quiet = TRUE)
+knitr::opts_chunk$set(comment = "#>")
+
+oldSource <- knit_hooks$get("source")
+knit_hooks$set(source = function(x, options) {
+  x <- oldSource(x, options)
+  x <- ifelse(!is.null(options$ref), paste0("\\label{", options$ref,"}", x), x)
+  ifelse(!is.null(options$codecap), paste0("\\captionof{chunk}{", options$codecap,"}", x), x)
+})
+```
+
+
+# Introduction
+These two vignettes contain walk-throughs of machine learning development in both R and in Python. 
+These tutorials aim to outline the basic steps in training and assessing ML models.
+The details presented are not meant to discuss the every detail of best practices in machine learning nor do they necessarily show how to develop the best performing model.
+Instead, the goals are to provide a clear example of how we go from data to predictions in the ML framework and to illustrate general machine learning principles.
+This document is designed for readers to follow along with the paper, and anybody interested in running the code should visit the github repo `github.com/edwardslee/R_paa_profile_classification`.
+
+# A machine learning walkthrough in R
+## Loading packages and data
+We start by making sure that the required packages are installed in R.
+We will be using the `tidyverse` package, which is a set of "opinionated" R packages that are designed to make data science simpler with human-readable, reproducible code.
+For the ML model, we will be using an implementation of extreme gradient boosted trees provided in the `xgboost` package, and we will use a function called `split_train_test()` from the `healthcareai` package.
+
+```{r r-setup, ref = "r-setup"}
+# installs packages that are not already installed
+install.packages(setdiff(c("tidyverse", "xgboost", "healthcareai", "ROCR"),
+                         rownames(installed.packages())))  
+```
+
+Once the packages are installed, we can load our packages.
+
+
+```{r load-packages, warning = FALSE, message = FALSE, results='hide', ref= "r-load-packages", codecap = "Code for loading R packages"}
+library(tidyverse)
+library(xgboost)
+library(ROCR)
+library(healthcareai)
+```
+\newpage
+
+## Data processing
+We proceed by loading our data into R.
+The variable `path_to_data` is the location of the csv file with the data, and the function `read_csv()` will import the data into a tibble.
+A tibble is a rectangular representation of data where each row represents an observation and each column represents a variable.
+Note that `path_to_data` must contain the directory and the file name of the data file from the Wilkes et al paper, which is named `clc317479-file001.csv` and found in the zip file in the supplementary data file.^[Wilkes et. al A machine learning approach for the automated interpretation of plasma amino acid profiles. Clinical Chemistry (2020). https://academic.oup.com/clinchem/article/66/9/1210/5900235]
+In this tutorial, the csv file should be placed in the same working directory that the code is being run in.
+However, if the file is located in a folder called `data/`, that is located in the working directory, then `path_to_data` should be `"data/clc317479-file001.csv"`.
+
+
+```{r r-load-data, message = FALSE, ref= "r-load-data", codecap = "Code for loading the data into R"}
+path_to_data <- "clc317479-file001.csv"
+df <- read_csv(path_to_data)
+df   # print a preview of the data frame
+```
+Each row represents a patient, and the column contains the data for each patient.
+The tibble contains an identifying `SID` for each patient, the patient's `SEX`, concentrations of different amino acids, alloisoleucine in `Allo`, homocysteine in `Hcys`, and argininosuccinic acid lyase deficiency in `ASA`.
+The `Class` column contains the "labels" normal and abnormal for each PAA profile.
+
+
+\newpage
+
+In order to prepare our tibble for machine learning purposes, we need to prepare our data into a form that the machine learning algorithms will accept.
+We will get rid of any variables that will not be inputted into XGBoost, and we will convert categorical variables into numeric values.
+The latter is required because XGBoost only accepts numerical data as inputs (this step is not necessarily required for other ML algorithms)
+
+1. We need to get rid any features that we will not input into the algorithm.
+In this case, we will need to remove the patient identifiers (the `SID` column).
+We do this by using the `select()` function to remove the `SID` column
+
+2. We need to convert any categorical variables into numerical codes.
+For example, the `SEX` column has values of `F` for female, `M` for male, and `U` for unidentified.
+We can use the `mutate()` function to convert these values to numbers in combination with the `case_when()` helper function to let `mutate()` to know which categorical values should become which numbers.
+
+
+```{r r-conversion, ref= "r-prepare-data", codecap = "Code for data preparation in R"}
+# remove the SID column
+df <- df %>% select(-SID)
+
+# convert categorical variables to numerical codes
+df <- df %>% 
+  mutate(
+    SEX = case_when(
+      SEX == "F" ~ 0,
+      SEX == "M" ~ 1,
+      SEX == "U" ~ 2)) %>%
+  mutate(
+    ASA = case_when(
+      ASA == "N" ~ 0,
+      ASA == "Y" ~ 1)) %>%
+  mutate(
+    Allo = case_when(
+      Allo == "N" ~ 0,
+      Allo == "Y" ~ 1)) %>%
+  mutate(
+    Hcys = case_when(
+      Hcys == "N" ~ 0,
+      Hcys == "Y" ~ 1
+    )
+  )
+
+# convert labels from text to numerical codes to a factor as required by XGBoost
+df <- df %>%
+  mutate(Class = case_when(
+    Class == "No.significant.abnormality.detected." ~ 0,
+    Class == "X.Abnormal" ~ 1
+  ))
+```
+
+\newpage
+
+## Splitting our data into a training, test, and validation set
+We will now split our dataset into a test set and a validation set.
+
+```{r r-split-train-test, ref= "r-split", codecap = "Code for creating train, test, and validation sets in R"}
+my_seed <- 7      # setting a seed to make results reproducible
+test_size <- 0.3  # test set is 30% of data 
+val_size  <- 0.2  # 20% of data not in test set to be used as the validation set
+
+# split dataset into train and test datasets
+traintest <- split_train_test(df,
+                              outcome = Class,
+                              percent_train = 1 - test_size,
+                              seed = my_seed)
+
+# split the initial train data frame into a small train set and a validation set
+trainval  <- split_train_test(traintest$train,
+                              outcome = Class,
+                              percent_train = 1 - val_size,
+                              seed = my_seed)
+
+# save the test, train, and validation sets into separate data frames
+df_test  <- traintest$test
+df_train <- trainval$train
+df_val   <- trainval$test
+
+# split each data frame into data and labels, and convert to xgb.Dmatrix objects
+dtest  <- xgb.DMatrix(data = select(df_test, -Class) %>% as.matrix(),
+                      label = select(df_test, Class) %>% as.matrix())
+dtrain <- xgb.DMatrix(data = select(df_train, -Class) %>% as.matrix(),
+                      label = select(df_train, Class) %>% as.matrix())
+dval   <- xgb.DMatrix(data = select(df_val, -Class) %>% as.matrix(),
+                      label = select(df_val, Class) %>% as.matrix())
+
+# save training and validation sets into a list, to be used for training later
+watchlist_model <- list(train = dtrain, val = dval)
+```
+
+
+The `split_train_test()` function will conveniently provide stratified random split.
+This is a helper function that will allow us to make appropriately random training, test, and validation sets.
+30\% of the data is dedicated to the test set (which we specified as `test_size <- 0.3`), and 70\% of the data is dedicated to the training set (indicated as the `percent_train = 1 - test_size` argument in the `split_train_test()` function).
+Stratified sampling ensures that both the train and test sets are divided into similar subgroups so that they are representative of the overall data set, and we will stratify based on the labels (normal vs abnormal) in the `Class` column by setting the `outcome` argument to equal to `Class`.
+This will cause the test, train, and validation sets to have similar numbers of normal and abnormal cases.
+
+
+In order to make this vignette reproducible, we set a seed that was specified as `my_seed <- 7` so that the same random splitting occurs (in practice, seeds should not be set to a value so that each train/test split is made from a different random sample every time the code is run).
+
+
+XGBoost in R does not accept data frames and requires a specialized xgb.DMatrix format as input, so we will convert our data frames to this format by using the `xgb.DMatrix()` function.^[This contrasts with the Python workflow, where XGBoost will accept a Python matrix and doesn't necessarily require this specialized xgb.DMatrix format (though it is preferred).]
+Doing this requires a few steps:
+
+1. We need to separate the data and the labels from the data frame by using the `select()` function to choose the data (`select(df, -Class)`) and to choose the labels (`select(df, Class)`).
+2. We need to convert the resulting data frame into an R matrix, which is achieved by passing the data frame into the `as.matrix()` function (e.g. `select(df, Class) %>% as.matrix()`).
+3. We use the `xgb.DMatrix()` function to convert everything into a xgb.DMatrix object.
+We use the names `data` and `label` to specify what the data and the labels are respectively.
+
+And finally, we put these matrices into a list and save them to an object called `watchlist_model`, which we will use in the XGBoost algorithm for training.
+
+\newpage
+
+## ML Training Protocol
+After preparing the data, we are ready to train the XGBoost model using the `xgb.train()` function.
+This function has a number of different parameters that we will explain briefly here:
+
+- `eta` is the so-called learning rate and takes a value between 0 and 1. 
+This parameter controls how robust the model is to overfitting.
+Low `eta` values causes the model to be less prone to overfitting but causes the model to take longer to compute.
+The default value is 0.3, but we decided to lower `eta` to 0.1 to reduce the risk of overfitting.
+- `max.depth` specifies the maximum depth of a tree.
+- `nrounds` is the number of boosted trees in the model.
+- `watchlist` is a *named* list of xgb.DMatrix datasets that we're inputting into the model to evaluate model performance.
+In the list `watchlist_model` that we created in the previous code block, we made a list of two xgb.Dmatrix objects, where the xgb.DMatrix `dtrain` was named as `train` and the xgb.DMatrix `dval` was named `val` in the list.
+- `objective` specifies the learning task and the objective function.
+In our case, the learning task is binary and the function is logistic regression.
+- `eval_metric` specifies the metric to use for the validation data.
+We will use `logloss` for our model.
+- `early_stopping_rounds`: training will stop if validation performance does not improve after *n* iterations of training.
+
+In order to make results reproducible for this vignette, we set a fixed seed by calling `set.seed(7)`.
+
+```{r r-train, ref= "r-train", codecap = "Code for training the ML model in R"}
+set.seed(7) # seed set to an arbitrary number for reproducibility
+xgb_model <- xgb.train(data = dtrain,
+                       max.depth = 6,
+                       eta = 0.1, 
+                       nrounds = 400,
+                       watchlist = watchlist_model,
+                       objective = "binary:logistic",
+                       eval_metric = "logloss",
+                       early_stopping_rounds = 10)
+
+```
+
+
+\newpage
+
+## Assessing for overfitting
+In order to assess for overfitting, we will draw the calculated loss values for each iteration of the training for the training set and the validation set.
+The loss values are recorded in the `evaluation_log` slot of the output of the training, which we access with `$` operator and using `xgb_model$evaluation_log`.
+This is saved to `results`, which is then manipulated with `pivot_longer()` function from the tidyr package to convert the data frame into a format that is easy for plotting.
+The loss values are then plotted for each iteration, and we visually see that the validation loss curve stops improving after iteration 72 (which we noted with a vertical line) and begins to diverge from the training loss curve.
+
+```{r, ref= "r-plot-loss", codecap = "Code for plotting train and validation loss in R"}
+results <- xgb_model$evaluation_log 
+results <- results %>%
+  pivot_longer(cols = c(train_logloss, val_logloss),
+               names_to = "set",
+               values_to = "loss") %>%
+  mutate(set = case_when(
+    set == "train_logloss" ~ "Train",
+    set == "val_logloss" ~ "Validation"
+  ))
+
+ggplot(results) +
+  geom_line(aes(iter, loss, color = set)) + 
+  geom_vline(xintercept = 72, linetype = "dashed") +
+  theme_light() + 
+  xlab("Iteration") +
+  ylab("Loss") +
+  theme (legend.title = element_blank())
+```
+
+
+\newpage
+
+## Calculating performance metrics
+We will now test how well our model makes predictions on data it has not seen before.
+We'll do that by using the model to make predictions on our test set (the xgb.Dmatrix object `dtest`) and then comparing the predictions of the model to the answers (also known as ``labels'').
+This is done with the `predict()` function and passing in the fitted model `xgb_model` and the test set `dtest`.
+The output will then be a vector of probabilities, and we will choose the default of 0.5 as the cutoff for predicting ``abnormal.'' 
+Thus, any probability greater than 0.5 is labeled as abnormal (`1`) and any less than 0.5 is labeled as normal (`0`), which is done with `as.integer(pred > 0.5)`.^[`pred > 0.5` returns a vector of `TRUE` or `FALSE`, and `as.integer()` converts `TRUE` to `1` and `FALSE` to `0`, achieving our desired result of converting probabilities greater than 0.5 to become `1`.] 
+We'll then get the labels from the test set using the `getinfo()` function, and then check the model's prediction with the labels using `as.integer(pred > 0.5) == label`
+```{r, ref= "r-accuracy", codecap = "Code for calculating accuracy in R"}
+# perform predictions on the test set and calculate the accuracy 
+pred <- predict(xgb_model, dtest)
+label <- getinfo(dtest, "label")
+accuracy <- as.numeric(sum(as.integer(pred > 0.5) == label)) / length(label)
+print(paste("Binomial Classification Accuracy:", accuracy * 100))
+```
+
+
+\newpage
+We evaluate the performance of the model's predictions by calculating the precision, recall, and the area under the precision-recall curve (AUC-PR).
+We use the `prediction()` function from the ROCR package to make a `prediction` object called `pred_rocr` using the predictions and labels from before, which will facilitate the calculations of these metrics.
+Passing `pred_rocr` into the `performance() `function will calculate the precision, recall, and AUC-PR with the appropriate arguments.
+We also plot the PR curve and print the AUC-PR as well.
+
+```{r, ref= "r-prauc", codecap = "Code for calculating PRAUC and plotting the PR curve in R"}
+pred_rocr <- prediction(pred, label)          # make prediction object
+PRAUC <- performance(pred_rocr, "aucpr")      # calculate AUC-PR
+rocr <- performance(pred_rocr, "prec", "rec") # calculate precision and recall
+plot(rocr)
+text(x = 0.3, y = 0.4,
+     paste0("Area under the PR curve: ",
+            formatC(round(PRAUC@y.values[[1]], 3), format = 'f', digits=3)
+     )
+)
+```
